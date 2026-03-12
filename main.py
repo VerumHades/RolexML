@@ -1,106 +1,173 @@
 import asyncio
-import random
 import json
-from playwright.async_api import async_playwright, Page
+import random
+from datetime import datetime
+from playwright.async_api import async_playwright, Page, ElementHandle
 from playwright_stealth import Stealth
 
-async def scrape_chrono24_full(url: str, pages_to_run: int,  starting_page: int):
+async def scrape_chrono24_full(url: str, pages_to_run: int, starting_page: int):
     """
-    Orchestrates the multi-page, deep-link extraction process.
+    Orchestrates extraction, ensuring sequential page navigation even when skipping collection.
     """
-    stealth_engine = Stealth()
-    async with stealth_engine.use_async(async_playwright()) as playwright:
-        browser = await playwright.chromium.launch(headless=False, slow_mo=100)
-        page = await browser.new_page()
-        await page.goto(url)
-        await handle_cookie_consent(page)
+    stealth_provider = Stealth()
+    clicked_elements = set()
+    async with async_playwright() as playwright_launcher:
+        log_event("Launching browser in headless mode...")
+        browser_instance = await playwright_launcher.chromium.launch(headless=False)
+        browser_context = await browser_instance.new_context()
+        active_page = await browser_context.new_page()
         
-        await process_pages(page, pages_to_run, starting_page)
-        await browser.close()
+        await stealth_provider.apply_stealth_async(active_page)
+        await start_proactive_monitors(active_page, clicked_elements)
+        
+        log_event(f"Starting journey at initial URL: {url}")
+        await active_page.goto(url)
+        await handle_cookie_consent(active_page)
+        await process_pages(active_page, pages_to_run, starting_page)
+        await browser_instance.close()
 
-async def process_pages(page: Page, total_pages: int,  starting_page: int):
+def log_event(message: str):
     """
-    Iterates through pagination and triggers deep-link processing for each page.
+    Prints a formatted timestamped message to the console.
     """
-    for current_num in range(1, total_pages + 1):
-        await human_scroll_to_bottom(page)
-        
-        if current_num >= starting_page:
-            # Get URLs once per page to avoid stale element issues
-            urls = await collect_listing_urls(page)
-            await process_listing_urls(page, urls)
-        
-        if current_num < total_pages:
-            await navigate_to_page_number(page, current_num + 1)
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}")
 
-async def process_listing_urls(page: Page, urls: list):
+async def process_pages(page: Page, total_pages: int, starting_page: int):
     """
-    Navigates to each watch, extracts table data, and flushes it to storage.
+    Navigates through pages sequentially; collects data only after reaching starting_page.
     """
-    for url in urls:
+    for current_index in range(1, total_pages + 1):
+        if current_index < starting_page:
+            log_event(f"Advancing: Page {current_index} (Skipping collection)")
+        else:
+            log_event(f"Active: Processing Search Page {current_index}")
+            await trigger_content_load(page)
+            listing_urls = await collect_listing_urls(page)
+            await process_listing_urls(page, listing_urls)
+        
+        if current_index < total_pages:
+            await navigate_to_next_page(page, current_index + 1)
+
+async def start_proactive_monitors(page: Page, clicked_elements: set):
+    """
+    Background listeners for survey and registration modals.
+    """
+    selectors = [
+        ".js-close-modal.btn.btn-link.m-r-3",
+        ".btn.btn-secondary.flex-1.w-100-sm.m-r-sm-5.js-close-modal"
+    ]
+    page.on("requestfinished", lambda _: asyncio.create_task(
+        dismiss_visible_popups(page, selectors, clicked_elements)
+    ))
+
+async def dismiss_visible_popups(page: Page, selectors: list, clicked: set):
+    """
+    Proactively dismisses popups in the background.
+    """
+    for selector in selectors:
         try:
-            await page.goto(url)
-            watch_data = await extract_table_data(page)
-            save_data_to_file(url, watch_data)
-        except Exception as error:
-            print(f"Error processing {url}: {error}")
+            btn = await page.query_selector(selector)
+            if btn and await btn.is_visible() and selector not in clicked:
+                log_event(f"Proactive Monitor: Closing popup {selector[:15]}...")
+                clicked.add(selector)
+                await human_click(page, btn)
+                await asyncio.sleep(4)
+                clicked.discard(selector)
+        except Exception:
+            continue
+
+async def process_listing_urls(page: Page, listing_urls: list):
+    """
+    Extracts data from individual watch listings on active pages.
+    """
+    for index, listing_url in enumerate(listing_urls, 1):
+        try:
+            log_event(f"  [{index}/{len(listing_urls)}] Extracting: {listing_url[:50]}...")
+            await page.goto(listing_url)
+            watch_specs = await extract_table_data(page)
+            save_scraped_data_to_storage(listing_url, watch_specs)
+        except Exception as extraction_error:
+            log_event(f"  [ERROR] Extraction failed: {extraction_error}")
         finally:
-            # Ensures we return to the listing flow even on failure
-            await page.go_back()
-            await page.wait_for_selector(".js-listing-item-link")
+            await return_to_listing_results(page)
+
+async def trigger_content_load(page: Page):
+    """
+    Skims page to trigger lazy loading.
+    """
+    for position in [0.4, 0.8, 1.0]:
+        scroll_script = f"window.scrollTo(0, document.body.scrollHeight * {position})"
+        await page.evaluate(scroll_script)
+        await asyncio.sleep(random.uniform(0.3, 0.6))
+
+async def handle_cookie_consent(page: Page):
+    """
+    Handles the initial cookie wall.
+    """
+    try:
+        cookie_btn = await page.wait_for_selector(".js-cookie-accept-all", timeout=5000)
+        if cookie_btn:
+            log_event("Handling initial cookie consent.")
+            await human_click(page, cookie_btn)
+    except Exception:
+        pass
+
+async def human_click(page: Page, target_element: ElementHandle):
+    """
+    Simulates human-like cursor movement and click.
+    """
+    box = await target_element.bounding_box()
+    if box:
+        await page.mouse.move(box["x"] + box["width"]/2, box["y"] + box["height"]/2, steps=10)
+        await asyncio.sleep(0.3)
+        await target_element.click(force=True)
 
 async def extract_table_data(page: Page) -> list:
     """
-    Finds all tables and extracts row text similarly to the BS4 separator logic.
+    Parses table specifications from the listing.
     """
-    await page.wait_for_selector("table")
+    await page.wait_for_selector("table", timeout=8000)
     return await page.evaluate("""() => {
-        const tables = Array.from(document.querySelectorAll('table'));
-        return tables.flatMap(table => 
-            Array.from(table.querySelectorAll('tr')).map(tr => tr.innerText.replace(/\\t/g, ': ').trim())
-        );
+        const rows = Array.from(document.querySelectorAll('table tr'));
+        return rows.map(r => r.innerText.replace(/\\t/g, ': ').trim());
     }""")
 
-def save_data_to_file(url: str, data: list):
+def save_scraped_data_to_storage(source_url: str, specifications: list):
     """
-    Flushes data to a JSONL file immediately to prevent data loss.
+    Saves data to JSONL format.
     """
-    entry = {"url": url, "specifications": data}
-    with open("scraped_watches.jsonl", "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    payload = {"timestamp": datetime.now().isoformat(), "url": source_url, "data": specifications}
+    with open("scraped_watches.jsonl", "a", encoding="utf-8") as storage_file:
+        storage_file.write(json.dumps(payload) + "\n")
 
 async def collect_listing_urls(page: Page) -> list:
     """
-    Retrieves all hrefs for the watch listings on the current page.
+    Finds watch links on the current results page.
     """
-    selector = "a.js-listing-item-link"
-    await page.wait_for_selector(selector)
-    return await page.locator(selector).evaluate_all("links => links.map(a => a.href)")
+    sel = "a.js-listing-item-link"
+    await page.wait_for_selector(sel)
+    return await page.locator(sel).evaluate_all("links => links.map(a => a.href)")
 
-async def handle_cookie_consent(page: Page):
-    """Clears the cookie consent layer."""
-    try:
-        button = await page.wait_for_selector(".js-cookie-accept-all", timeout=5000)
-        if button: await button.click()
-    except: pass
-
-async def navigate_to_page_number(page: Page, target_num: int):
-    """Navigates to the next page in the pagination list."""
-    selector = "nav.pagination ul li a"
-    await page.wait_for_selector(selector)
-    links = await page.query_selector_all(selector)
-
+async def navigate_to_next_page(page: Page, target_page_number: int):
+    """
+    Clicks the pagination link for the next sequential page.
+    """
+    pagination_selector = "nav.pagination ul li a"
+    await page.wait_for_selector(pagination_selector)
+    links = await page.query_selector_all(pagination_selector)
     for link in links:
-        if (await link.inner_text()).strip() == str(target_num):
-            await link.click()
+        if (await link.inner_text()).strip() == str(target_page_number):
+            await human_click(page, link)
             await page.wait_for_load_state("networkidle")
             return
 
-async def human_scroll_to_bottom(page: Page):
-    """Mimics human scrolling."""
-    for _ in range(4):
-        await page.mouse.wheel(0, 800)
-        await asyncio.sleep(0.5)
+async def return_to_listing_results(page: Page):
+    """
+    Navigates back to search results.
+    """
+    await page.go_back()
+    await page.wait_for_selector(".js-listing-item-link")
 
 if __name__ == "__main__":
-    asyncio.run(scrape_chrono24_full("https://www.chrono24.com/rolex/index.htm", 27, 16))
+    asyncio.run(scrape_chrono24_full("https://www.chrono24.com/rolex/index.htm", 1000, 27))

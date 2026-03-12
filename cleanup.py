@@ -1,48 +1,65 @@
 import pandas as pd
 import json
 
-def load_jsonl_to_dataframe(file_path):
+def load_json_lines(file_path):
     """
-    Reads a JSONL file and returns a pandas DataFrame.
+    Reads a JSONL file and returns a list of dictionaries.
     """
     with open(file_path, 'r') as file:
-        data = [json.loads(line) for line in file]
-    return pd.DataFrame(data)
+        return [json.loads(line) for line in file]
 
-def clean_price(price_string):
+def parse_specification_list(specifications_list):
     """
-    Removes currency symbols and commas to convert price to a float.
+    Converts a list of 'Key: Value' strings into a dictionary.
     """
-    if not isinstance(price_string, str):
-        return price_string
+    parsed_data = {}
+    for entry in specifications_list:
+        if ":" in entry:
+            key, value = entry.split(":", 1)
+            parsed_data[key.strip()] = value.strip()
+    return parsed_data
+
+def extract_watch_metadata(row):
+    """
+    Normalizes watch data from either the 'data' or 'specifications' field.
+    """
+    # Check which field contains the technical specs
+    raw_specs = row.get("specifications") or row.get("data") or []
     
-    numeric_price = price_string.replace('$', '').replace(',', '').strip()
-    return float(numeric_price)
-
-def extract_reference_number(spec_list):
-    """
-    Parses the specifications list to find the Reference Number.
-    """
-    prefix = "Reference number: "
-    for item in spec_list:
-        if item.startswith(prefix):
-            return item.replace(prefix, "").strip()
-    return None
-
-def process_watch_data(raw_dataframe):
-    """
-    Orchestrates the cleaning and transformation of the watch DataFrame.
-    """
-    df = raw_dataframe.copy()
+    if isinstance(raw_specs, list):
+        return parse_specification_list(raw_specs)
     
-    df['price_usd'] = df['Price'].apply(clean_price)
-    df['reference_number'] = df['specifications'].apply(extract_reference_number)
+    return {}
+
+def transform_to_clean_dataframe(raw_records):
+    """
+    Orchestrates the transformation of raw JSON objects into a structured DataFrame.
+    """
+    normalized_data = []
     
-    return df[['url', 'Brand', 'Model', 'reference_number', 'price_usd', 'Year of production']]
+    for record in raw_records:
+        specs = extract_watch_metadata(record)
+        # Preserve the URL for reference
+        specs["url"] = record.get("url")
+        normalized_data.append(specs)
+        
+    return pd.DataFrame(normalized_data)
 
-# Usage
-raw_df = load_jsonl_to_dataframe('watches.jsonl')
-clean_df = process_watch_data(raw_df)
+def export_watch_data(file_input_path, file_output_path):
+    """
+    Main execution flow to convert JSONL to a CSV table.
+    """
+    raw_records = load_json_lines(file_input_path)
+    clean_dataframe = transform_to_clean_dataframe(raw_records)
+    
+    # Drop duplicates based on Reference number if it exists
+    if "Reference number" in clean_dataframe.columns:
+        clean_dataframe = clean_dataframe.drop_duplicates(
+            subset=["Reference number"], 
+            keep="first"
+        )
+    
+    clean_dataframe.to_csv(file_output_path, index=False)
 
-with open("output.json","w") as f:
-    json.dump(f, clean_df)
+if __name__ == "__main__":
+    export_watch_data("scraped_watches.jsonl", "watches_table.csv")
